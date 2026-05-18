@@ -1,0 +1,15 @@
+node_modules/
+.next/
+out/
+tsconfig.tsbuildinfo
+.env
+.env.local
+.env*.local
+*.log
+.DS_Store
+.vercel
+.turbo
+# keep generated sample data committed; live data lives under public/data/live/ (gitignored)
+public/data/live/
+data-pipeline/.cache/
+coverage/

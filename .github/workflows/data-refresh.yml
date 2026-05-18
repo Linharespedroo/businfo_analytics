@@ -1,0 +1,63 @@
+name: Refresh analytics data
+
+on:
+  schedule:
+    # Roda diariamente às 06:15 UTC (03:15 BRT) — depois da janela típica de
+    # entrega do GA4 → BigQuery (intraday + daily batch).
+    - cron: '15 6 * * *'
+  workflow_dispatch:
+    inputs:
+      lookback_days:
+        description: 'Janela em dias (default 90)'
+        required: false
+        default: '90'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    env:
+      BQ_PROJECT_ID: lpdev-6b8e0
+      BQ_DATASET: analytics_472265609
+      BQ_LOCATION: US
+      BQ_TIMEZONE: America/Sao_Paulo
+      BQ_LOOKBACK_DAYS: ${{ github.event.inputs.lookback_days || '90' }}
+      GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+      NEON_DATABASE_URL: ${{ secrets.NEON_DATABASE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - name: Refresh data
+        run: |
+          if [ -z "$GOOGLE_APPLICATION_CREDENTIALS_JSON" ]; then
+            echo "::warning::Sem credenciais BQ — gerando amostra."
+            npm run data:sample
+          else
+            npm run data:refresh
+          fi
+
+      - name: Commit & push (if changed)
+        run: |
+          git config user.name "businfo-analytics-bot"
+          git config user.email "bot@businfo.local"
+          git add public/data/bundle.json public/data/manifest.json
+          if git diff --cached --quiet; then
+            echo "Nada a commitar."
+          else
+            git commit -m "data: refresh bundle $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push
+          fi
