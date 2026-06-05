@@ -1,0 +1,9 @@
+# Coletor SIM/SPTrans — dependências Python
+#
+# Playwright é necessário porque o botão "Entrar" do portal SIM é uma <div>
+# com handler JavaScript (ASP.NET WebForms), não submetível via HTTP puro.
+# Depois do login, usamos `requests` para a chamada à API: é mais leve e
+# rápido para a resposta JSON que pode passar de 7 MB descomprimidos.
+
+playwright==1.49.1
+requests==2.32.3

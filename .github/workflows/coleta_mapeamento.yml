@@ -1,0 +1,122 @@
+name: Coleta Mapeamento SPTrans
+
+# Coleta diária do JSON de mapeamento de veículos do portal SIM/SPTrans.
+# Executa src/main.py (Playwright + requests), grava em data/, e commita
+# a mudança se o conteúdo for diferente do já versionado.
+
+on:
+  schedule:
+    # 1x ao dia — 08:00 BRT (11:00 UTC). Ajuste se quiser horário diferente.
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+    inputs:
+      log_level:
+        description: 'Nível de log do coletor'
+        required: false
+        default: 'INFO'
+        type: choice
+        options: [DEBUG, INFO, WARNING, ERROR]
+      max_relogin:
+        description: 'Quantas vezes refazer login se a sessão expirar'
+        required: false
+        default: '1'
+
+permissions:
+  contents: write   # necessário para o commit/push do JSON atualizado
+
+concurrency:
+  group: coleta-mapeamento
+  cancel-in-progress: false
+
+jobs:
+  coleta:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SIM_LOGIN: ${{ secrets.SIM_LOGIN }}
+      SIM_PASSWORD: ${{ secrets.SIM_PASSWORD }}
+      LOG_LEVEL: ${{ github.event.inputs.log_level || 'INFO' }}
+      MAX_RELOGIN: ${{ github.event.inputs.max_relogin || '1' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Necessário para o push de volta com a mesma sessão
+          persist-credentials: true
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
+
+      - name: Validar secrets
+        run: |
+          if [ -z "$SIM_LOGIN" ] || [ -z "$SIM_PASSWORD" ]; then
+            echo "::error::Os secrets SIM_LOGIN e SIM_PASSWORD não estão configurados no repositório."
+            echo "Adicione em Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Instalar dependências Python
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+
+      - name: Instalar Chromium (Playwright)
+        # --with-deps garante libs nativas do SO; rode sempre, é idempotente
+        # e não passa de poucos segundos quando o cache do navegador acerta.
+        run: python -m playwright install --with-deps chromium
+
+      - name: Executar coleta
+        run: |
+          python src/main.py \
+            --log-level "$LOG_LEVEL" \
+            --max-relogin "$MAX_RELOGIN"
+
+      - name: Upload diagnósticos (em caso de falha)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ github.run_id }}
+          path: |
+            diagnostics/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Commit e push do JSON atualizado
+        if: success()
+        run: |
+          git config user.name  "sim-coleta-bot"
+          git config user.email "sim-coleta-bot@users.noreply.github.com"
+
+          # -A pega também a deleção do arquivo antigo quando alternamos
+          # entre .json e .json.gz por causa do threshold de compressão.
+          git add -A data/
+
+          if git diff --cached --quiet; then
+            echo "Sem mudanças no JSON — nada a commitar."
+          else
+            git commit -m "data: atualiza mapeamento_veiculos $(date -u +%Y-%m-%dT%H:%MZ)"
+            # Retry simples no push (rede transitória)
+            for i in 1 2 3 4; do
+              if git push origin HEAD:${{ github.ref_name }}; then
+                exit 0
+              fi
+              sleep $((2 ** i))
+              git pull --rebase origin ${{ github.ref_name }} || true
+            done
+            echo "::error::git push falhou após 4 tentativas"
+            exit 1
+          fi

@@ -13,3 +13,8 @@ tsconfig.tsbuildinfo
 public/data/live/
 data-pipeline/.cache/
 coverage/
+
+# Coletor SIM (Python)
+__pycache__/
+*.pyc
+diagnostics/
