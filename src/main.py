@@ -163,42 +163,132 @@ def _save_diagnostics(page: Page, prefix: str) -> None:
 
 
 def _click_entrar(page: Page) -> None:
-    """Clica no botão 'Entrar' — é uma <div>, handler JS."""
+    """Aciona o postback do botão "Entrar".
+
+    O markup real é ``<a id="entrar" href="javascript:WebForm_DoPostBack...">``
+    com um ``<div class="divBtnEntrar">`` decorativo dentro. Clicar só no
+    ``<div>`` nem sempre dispara o handler do ``<a>`` — então preferimos o
+    ``<a>``, com fallback direto para o postback ASP.NET via ``evaluate``.
+    """
+
+    link = page.query_selector("#entrar")
+    if link is not None:
+        try:
+            link.scroll_into_view_if_needed(timeout=3_000)
+            link.click(timeout=5_000)
+            return
+        except Exception as exc:  # noqa: BLE001
+            LOG.debug("Clique em <a id='entrar'> falhou (%s) — tentando postback direto", exc)
+
+    # Fallback 1: dispara o helper do próprio WebForms
+    try:
+        page.evaluate(
+            "WebForm_DoPostBackWithOptions(new WebForm_PostBackOptions("
+            "'entrar', '', true, '', '', false, true))"
+        )
+        return
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("WebForm_DoPostBackWithOptions falhou (%s) — tentando __doPostBack", exc)
+
+    # Fallback 2: chama __doPostBack direto (sem validação)
+    try:
+        page.evaluate("__doPostBack('entrar', '')")
+        return
+    except Exception as exc:  # noqa: BLE001
+        LOG.debug("__doPostBack falhou (%s) — tentando clicar no <div>", exc)
+
+    # Fallback 3: clique no <div> decorativo (versões antigas)
     btn = page.locator(SEL_BTN_ENTRAR).first
-    btn.scroll_into_view_if_needed(timeout=5_000)
+    btn.scroll_into_view_if_needed(timeout=3_000)
     btn.click(timeout=5_000)
 
 
 def _extract_login_error(page: Page) -> Optional[str]:
     """Tenta extrair mensagem de erro do form de login."""
     candidates = [
+        "#lblMsg",
         "#lblErro",
         ".lblErro",
         ".erroLogin",
         "[id*='Erro']",
         "[id*='erro']",
         "[class*='erro']",
+        ".labelError",
     ]
     for sel in candidates:
         try:
-            el = page.query_selector(sel)
-            if not el:
-                continue
-            txt = (el.text_content() or "").strip()
-            if txt:
-                return txt[:200]
+            for el in page.query_selector_all(sel):
+                txt = (el.text_content() or "").strip()
+                if txt:
+                    return txt[:200]
         except Exception:  # noqa: BLE001
             continue
     return None
 
 
-def _is_login_screen(page: Page) -> bool:
-    """True se o campo de login está visível na tela atual."""
+def _has_credentials_form(page: Page) -> bool:
+    """1ª tela do SIM: campo de senha visível e habilitado."""
     try:
-        el = page.query_selector(SEL_LOGIN_INPUT)
-        return el is not None and el.is_visible()
+        el = page.query_selector(SEL_PASS_INPUT)
+        if el is None or not el.is_visible():
+            return False
+        try:
+            return not el.is_disabled()
+        except Exception:  # noqa: BLE001
+            return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def _has_context_form(page: Page) -> bool:
+    """2ª tela do SIM: ``txtLogin`` desabilitado + selects de contexto.
+
+    Sinais positivos: ``#ddlEmpresa`` presente, OU ``#txtLogin`` existe e está
+    com ``disabled``. Note que ``txtLogin`` continua no DOM nessa tela, só que
+    em modo read-only — foi o que me enganou na primeira versão da heurística.
+    """
+    try:
+        empresa = page.query_selector("#ddlEmpresa")
+        if empresa is not None and empresa.is_visible():
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        login_el = page.query_selector(SEL_LOGIN_INPUT)
+        if login_el is None or not login_el.is_visible():
+            return False
+        try:
+            return login_el.is_disabled()
+        except Exception:  # noqa: BLE001
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _debug_form_state(page: Page) -> str:
+    """Resumo rápido do que o navegador está mostrando — útil em erro."""
+    parts: list[str] = [f"url={page.url}"]
+    try:
+        parts.append(f"title={page.title()!r}")
+    except Exception:  # noqa: BLE001
+        pass
+    for sel in (SEL_LOGIN_INPUT, SEL_PASS_INPUT, "#ddlEmpresa", "#entrar", SEL_BTN_ENTRAR):
+        try:
+            el = page.query_selector(sel)
+            if el is None:
+                parts.append(f"{sel}=absent")
+            else:
+                vis = el.is_visible()
+                disabled = ""
+                try:
+                    disabled = " disabled" if el.is_disabled() else ""
+                except Exception:  # noqa: BLE001
+                    pass
+                parts.append(f"{sel}=visible={vis}{disabled}")
+        except Exception:  # noqa: BLE001
+            parts.append(f"{sel}=err")
+    return " | ".join(parts)
+
 
 
 def login_with_playwright(
@@ -230,62 +320,117 @@ def login_with_playwright(
         context.set_default_navigation_timeout(LOGIN_NAV_TIMEOUT_MS)
 
         page = context.new_page()
+        page.on(
+            "pageerror",
+            lambda exc: LOG.debug("JS pageerror: %s", exc),
+        )
+        page.on(
+            "requestfailed",
+            lambda req: LOG.debug(
+                "Request falhou: %s %s — %s",
+                req.method,
+                req.url,
+                getattr(req.failure, "error_text", req.failure),
+            ),
+        )
+
         LOG.info("Acessando %s", ENTRY_URL)
         page.goto(ENTRY_URL, wait_until="domcontentloaded")
 
-        # 1ª tela: credenciais
+        # 1ª tela: credenciais — esperamos o CAMPO DE SENHA, que só existe
+        # nessa tela. Usar #txtLogin não serve: ele continua no DOM (disabled)
+        # na 2ª tela de seleção de contexto.
         try:
-            page.wait_for_selector(SEL_LOGIN_INPUT, state="visible", timeout=15_000)
+            page.wait_for_selector(SEL_PASS_INPUT, state="visible", timeout=15_000)
         except PlaywrightTimeoutError as exc:
-            _save_diagnostics(page, "login-no-input")
+            _save_diagnostics(page, "no-credentials-form")
             raise StructureChangedError(
-                f"Campo de login {SEL_LOGIN_INPUT!r} não apareceu — front pode ter mudado"
+                f"Campo de senha {SEL_PASS_INPUT!r} não apareceu — front pode ter mudado. "
+                f"Estado: {_debug_form_state(page)}"
             ) from exc
 
-        LOG.info("Preenchendo credenciais (login=%s***)", login[:2])
+        LOG.info(
+            "Tela de credenciais detectada — preenchendo (login=%s***) | %s",
+            login[:2],
+            _debug_form_state(page),
+        )
         page.fill(SEL_LOGIN_INPUT, login)
         page.fill(SEL_PASS_INPUT, password)
 
-        if page.query_selector(SEL_BTN_ENTRAR) is None:
-            _save_diagnostics(page, "login-no-btn")
-            raise StructureChangedError(
-                f"Botão 'Entrar' {SEL_BTN_ENTRAR!r} não encontrado na 1ª tela"
-            )
-
-        LOG.info("Clicando em 'Entrar' (1ª tela)")
+        LOG.info("Acionando 'Entrar' (1ª tela)")
         _click_entrar(page)
 
+        # Espera SAIR da tela de credenciais: o #txtSenha desaparece ou some
+        # de visibilidade após o postback. Se ficar travado aqui, o login
+        # falhou (credenciais inválidas, validação client-side, etc.).
         try:
-            page.wait_for_load_state("networkidle", timeout=LOGIN_NAV_TIMEOUT_MS)
-        except PlaywrightTimeoutError:
-            LOG.warning("networkidle não alcançado após 1º clique — seguindo assim mesmo")
-
-        # 2ª tela de confirmação (alguns logins exibem; outros não).
-        # Detectamos pela presença de outro divBtnEntrar visível com o campo
-        # de login *fora* da tela (não é a tela de login original).
-        try:
-            page.wait_for_selector(
-                SEL_BTN_ENTRAR, state="visible", timeout=SECOND_SCREEN_WAIT_MS
+            page.wait_for_function(
+                """() => {
+                    const el = document.querySelector('#txtSenha');
+                    return !el || el.offsetParent === null;
+                }""",
+                timeout=LOGIN_NAV_TIMEOUT_MS,
             )
-            if not _is_login_screen(page):
-                LOG.info("Detectada 2ª tela de confirmação — clicando 'Entrar'")
-                _click_entrar(page)
-                try:
-                    page.wait_for_load_state(
-                        "networkidle", timeout=LOGIN_NAV_TIMEOUT_MS
-                    )
-                except PlaywrightTimeoutError:
-                    LOG.warning("networkidle não alcançado após 2º clique")
-            else:
-                LOG.debug("Botão 'Entrar' presente mas tela ainda é a de login — sem 2ª etapa")
-        except PlaywrightTimeoutError:
-            LOG.info("Nenhuma 2ª tela detectada — login direto")
+        except PlaywrightTimeoutError as exc:
+            err = _extract_login_error(page) or "(sem mensagem específica)"
+            _save_diagnostics(page, "stuck-on-credentials")
+            raise RuntimeError(
+                f"Login falhou na 1ª tela — campo de senha ainda visível. "
+                f"Erro reportado: {err}. Estado: {_debug_form_state(page)}"
+            ) from exc
 
-        # Sanidade: não estamos mais na tela de login
-        if _is_login_screen(page):
+        try:
+            page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
+        except PlaywrightTimeoutError:
+            LOG.debug("networkidle não alcançado pós-1ºclique (segue)")
+
+        LOG.info("Saiu da tela de credenciais — %s", _debug_form_state(page))
+
+        # 2ª tela: seleção de contexto (CCI/CCO/Área/Empresa/Garagem).
+        # Os defaults já vêm preenchidos para o usuário, então só re-acionamos
+        # o "Entrar" para confirmar.
+        if _has_context_form(page):
+            LOG.info("Detectada 2ª tela (contexto) — acionando 'Entrar' novamente")
+            _click_entrar(page)
+
+            try:
+                page.wait_for_function(
+                    """() => {
+                        const dd = document.querySelector('#ddlEmpresa');
+                        const tx = document.querySelector('#txtLogin');
+                        const sem_empresa = !dd || dd.offsetParent === null;
+                        const tx_libre = !tx || !tx.disabled;
+                        return sem_empresa && tx_libre;
+                    }""",
+                    timeout=LOGIN_NAV_TIMEOUT_MS,
+                )
+            except PlaywrightTimeoutError as exc:
+                err = _extract_login_error(page) or "(sem mensagem específica)"
+                _save_diagnostics(page, "stuck-on-context")
+                raise RuntimeError(
+                    f"Login falhou na 2ª tela — selects de contexto ainda visíveis. "
+                    f"Erro reportado: {err}. Estado: {_debug_form_state(page)}"
+                ) from exc
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT_MS)
+            except PlaywrightTimeoutError:
+                LOG.debug("networkidle não alcançado pós-2ºclique (segue)")
+
+            LOG.info("Saiu da 2ª tela — %s", _debug_form_state(page))
+        else:
+            LOG.info("Nenhuma 2ª tela detectada — login em etapa única")
+
+        # Sanidade final: não pode mais ter nem credenciais nem contexto.
+        if _has_credentials_form(page) or _has_context_form(page):
             err = _extract_login_error(page) or "(sem mensagem específica)"
             _save_diagnostics(page, "login-failed")
-            raise RuntimeError(f"Login falhou — ainda na tela de credenciais: {err}")
+            raise RuntimeError(
+                f"Login não finalizou — ainda em tela de auth/contexto. "
+                f"Erro reportado: {err}. Estado: {_debug_form_state(page)}"
+            )
+
+        LOG.info("Autenticado — %s", _debug_form_state(page))
 
         # Navega para a página de Mapeamento. Usa a origin atual (servidor
         # pode ser sim.sptrans.com.br ou um nó de webfarm como v1140.*).
@@ -298,10 +443,11 @@ def login_with_playwright(
         except PlaywrightTimeoutError:
             LOG.warning("Página de Mapeamento não chegou a networkidle (ok)")
 
-        if _is_login_screen(page):
+        if _has_credentials_form(page) or _has_context_form(page):
             _save_diagnostics(page, "mapeamento-redirected-to-login")
             raise SessionExpiredError(
-                "Página de Mapeamento redirecionou para login — sessão sem permissão"
+                f"Mapeamento redirecionou para tela de login/contexto — "
+                f"sessão sem permissão. Estado: {_debug_form_state(page)}"
             )
 
         # Em algumas versões a página final só fica disponível dentro de um
