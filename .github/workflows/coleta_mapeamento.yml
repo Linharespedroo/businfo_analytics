@@ -1,8 +1,9 @@
 name: Coleta Mapeamento SPTrans
 
 # Coleta diária do JSON de mapeamento de veículos do portal SIM/SPTrans.
-# Executa src/main.py (Playwright + requests), grava em data/, e commita
-# a mudança se o conteúdo for diferente do já versionado.
+# Executa collectors/mapeamento_veiculos/main.py (Playwright + requests),
+# grava em data/, e commita a mudança se o conteúdo for diferente do já
+# versionado.
 
 on:
   schedule:
@@ -50,7 +51,7 @@ jobs:
         with:
           python-version: '3.11'
           cache: 'pip'
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: collectors/mapeamento_veiculos/requirements.txt
 
       - name: Validar secrets
         run: |
@@ -63,7 +64,7 @@ jobs:
       - name: Instalar dependências Python
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r collectors/mapeamento_veiculos/requirements.txt
 
       - name: Cache Playwright browsers
         id: pw-cache
@@ -81,7 +82,7 @@ jobs:
 
       - name: Executar coleta
         run: |
-          python src/main.py \
+          python collectors/mapeamento_veiculos/main.py \
             --log-level "$LOG_LEVEL" \
             --max-relogin "$MAX_RELOGIN"
 

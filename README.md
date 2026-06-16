@@ -229,174 +229,32 @@ businfo_analytics/
 
 ---
 
-## Coletor SIM/SPTrans (`src/main.py`)
+## Coletores de dados do SIM/SPTrans
 
-Pipeline paralelo, escrito em Python, que extrai diariamente o **mapeamento de
-veículos** do portal SIM da SPTrans (`http://sim.sptrans.com.br`) e versiona o
-JSON resultante em `data/mapeamento_veiculos.json`.
+Dois pipelines Python independentes, cada um na sua pasta sob `collectors/`,
+com seu próprio `requirements.txt` e workflow do GitHub Actions. A saída de
+ambos vai para `data/` na raiz do repo.
 
-### Como funciona o login do SIM
+| Coletor | Pasta | Saída | Auth? | Workflow | Schedule (UTC) |
+| --- | --- | --- | --- | --- | --- |
+| Mapeamento de veículos (API autenticada) | `collectors/mapeamento_veiculos/` | `data/mapeamento_veiculos.json[.gz]` | Sim (Playwright loga no portal SIM) | `.github/workflows/coleta_mapeamento.yml` | `0 11 * * *` (08:00 BRT) |
+| Frota por empresa (Pedra Eletrônica) | `collectors/frota_pedra/` | `data/frota.json` | Não (endpoints públicos) | `.github/workflows/coleta_frota.yml` | `0 6 * * *` (03:00 BRT) |
 
-O portal é **ASP.NET WebForms** com um detalhe importante: o botão "Entrar" é
-uma `<div class="divBtnHeader divBtnEntrar">`, **não um `<button>`**. Quem
-realmente envia o formulário é um handler JavaScript em cima do `<div>`. Por
-causa disso, reproduzir o login com `requests` puro exigiria:
+Cada coletor tem seu README dedicado com a explicação técnica completa
+(autenticação, cookies, endpoints, parsers, robustez, implantação):
 
-1. Baixar o HTML inicial e extrair `__VIEWSTATE`, `__EVENTVALIDATION` e
-   `__VIEWSTATEGENERATOR`.
-2. Reconstruir o `__doPostBack(...)` que o handler faria.
-3. Repetir a coreografia da **segunda tela de confirmação** (que também tem
-   um `<div>` "Entrar").
-4. Lidar com a sticky session do balanceador (`simsrv=sN`) que muda o
-   subdomínio para algo como `v1140.webfarm.sim.sptrans.com.br`.
+- [`collectors/mapeamento_veiculos/README.md`](collectors/mapeamento_veiculos/README.md)
+- [`collectors/frota_pedra/README.md`](collectors/frota_pedra/README.md)
 
-Qualquer mudança de versão do SIM quebraria isso. Por isso o login real é
-feito via **Playwright (Chromium headless)** — o JavaScript executa
-naturalmente e o estado de sessão é populado igualzinho ao de um usuário real.
-Depois do login, **trocamos para `requests`** para chamar a API: é muito mais
-leve para uma resposta que passa de 7 MB descomprimidos.
+### Implantação rápida
 
-### Cookies que importam de verdade
-
-Capturados de uma sessão real e verificados como necessários:
-
-| Cookie | Origem | Função |
-| --- | --- | --- |
-| `simsrv` | balanceador | sticky session — fixa o nó do webfarm. Sem ele, próxima request pode cair em outro servidor e perder a sessão. |
-| `ASP.NET_SessionId` | IIS | sessão ASP.NET (state server). |
-| `s11.4.0-1Auth` (ou similar terminado em `Auth`) | aplicação | **token de autenticação** — sem ele a API retorna redirect para login. O prefixo (`s11.4.0-1`) varia com a versão do SIM. |
-| `v1140-1mostrarJanelaNovidades`, `V11.4.0-1cookieNovidadesMapa` | UI | flags de modal — opcionais para a API. |
-| `_ga*`, `_gid` | GA4 | analytics — irrelevantes. |
-
-O script pega **todos** os cookies do contexto Playwright e replica no
-`requests.Session` apontando para o host correto. Não tentamos filtrar por
-nome porque o prefixo `s11.4.0-1Auth` muda de versão.
-
-### Endpoint chamado
-
-```
-POST {origin}/api/MapeamentoVeiculos/ListarMapeamentoVeiculosLinhaTodos
-```
-
-Onde `{origin}` é exatamente o origin em que a página de Mapeamento
-terminou de carregar (o subdomínio do webfarm — `v1140.webfarm...` hoje,
-poderia ser outro amanhã). Headers que o servidor exige na prática:
-
-```
-Content-Type:    application/json; charset=utf-8
-X-Requested-With: XMLHttpRequest
-Accept:          application/json, text/javascript, */*; q=0.01
-Origin:          {origin}
-Referer:         {origin}/geo/frmNovoMapeamento.aspx
-Accept-Encoding: gzip, deflate
-```
-
-Payload (exato — `Content-Length: 57`):
-
-```json
-{"filtro":["","","","",0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,""]}
-```
-
-### Robustez
-
-Implementado em `src/main.py`:
-
-- **Retry exponencial** (2s → 4s → 8s) em erros de rede e HTTP 5xx.
-- **Timeout duplo** no requests: 15s para conectar, 180s para receber.
-- **Detecção de sessão expirada**: qualquer 3xx, 401 ou 403 vira
-  `SessionExpiredError`, que aciona até `--max-relogin` (default 1) relogins
-  do zero antes de desistir.
-- **Detecção de mudança de estrutura**: se o seletor `#txtLogin` ou
-  `div.divBtnEntrar` sumir, ou se o endpoint passar a retornar HTML / 404,
-  o script falha com `StructureChangedError` (sai com código distinto para
-  facilitar alerta).
-- **Diagnósticos**: em qualquer falha do Playwright salva screenshot + HTML
-  em `diagnostics/` — o workflow faz upload como artifact.
-- **Logs estruturados** com `INFO` por default, `DEBUG` mostrando chaves dos
-  cookies e estados intermediários.
-- **Validação leve do JSON**: loga as chaves top-level ou o tamanho do
-  array, para detectar regressões silenciosas no schema.
-
-### Compressão automática
-
-Se o JSON descomprimido passar de **10 MB** (configurável via
-`SIM_COMPRESS_THRESHOLD_MB`), o script grava `mapeamento_veiculos.json.gz`
-em vez do `.json` e remove a versão antiga — para evitar carregar dois
-arquivos no Git ao mesmo tempo.
-
-### Códigos de saída
-
-| Código | Significado |
-| --- | --- |
-| `0` | Sucesso |
-| `2` | Variáveis `SIM_LOGIN`/`SIM_PASSWORD` ausentes |
-| `3` | Falha no login (credenciais ou front mudou) |
-| `4` | Sessão expirou e excedeu `--max-relogin` |
-| `5` | Falha persistente na API (5xx, schema mudou, etc.) |
-| `6` | Falha gravando o arquivo |
-
-### Rodando localmente
-
-```bash
-# 1. Dependências
-pip install -r requirements.txt
-python -m playwright install --with-deps chromium
-
-# 2. Credenciais (use .env.local fora do git)
-export SIM_LOGIN=trsantos
-export SIM_PASSWORD='Sophia2112'
-
-# 3. Coleta normal
-python src/main.py --log-level DEBUG
-
-# 4. Modo "probe" — só loga, imprime cookies e sai
-python src/main.py --probe
-
-# 5. Modo headed (Chromium visível) — útil para debug local
-python src/main.py --headed --log-level DEBUG
-```
-
-### Workflow (`.github/workflows/coleta_mapeamento.yml`)
-
-- **Agenda**: `cron: '0 11 * * *'` (08:00 BRT). Editar à vontade.
-- **Trigger manual**: `workflow_dispatch` com inputs para nível de log e
-  número máximo de relogins.
-- **Concorrência**: bloqueia execuções paralelas no mesmo group.
-- **Cache**: pip + binários do Playwright (`~/.cache/ms-playwright`).
-- **Commit automático**: usa `git add -A data/` (para capturar deleções
-  quando trocamos `.json` ↔ `.json.gz`) e faz `push` com 4 tentativas de
-  retry/rebase em caso de race.
-- **Artifacts**: em falha, faz upload de `diagnostics/` (screenshot + HTML).
-
-### Implantação — passo a passo
-
-1. Criar dois GitHub Secrets em **Settings → Secrets and variables →
-   Actions**:
-   - `SIM_LOGIN`
-   - `SIM_PASSWORD`
-2. Garantir que o token do `GITHUB_TOKEN` tem permissão de escrita no repo
-   (default em repos próprios; em organizações pode estar limitado em
-   **Settings → Actions → General → Workflow permissions** → "Read and write").
-3. Subir os arquivos:
-   - `src/main.py`
-   - `requirements.txt`
-   - `.github/workflows/coleta_mapeamento.yml`
-4. Disparar a primeira execução manualmente em **Actions → Coleta
-   Mapeamento SPTrans → Run workflow** para validar.
-5. A partir daí, o cron diário cuida do resto. O `data/mapeamento_veiculos.json`
-   (ou `.json.gz`) será atualizado e versionado a cada execução com mudança.
-
-### Limitações conhecidas
-
-- Se a SPTrans mudar a estrutura da tela de login (ID dos campos, classe do
-  botão), o login falha com `StructureChangedError` — basta atualizar os
-  seletores no topo de `src/main.py`.
-- Captura de mensagens de erro do login é heurística (varre vários seletores
-  comuns) — em produção pode precisar de ajuste com base na mensagem real.
-- O portal é **HTTP**, não HTTPS — Chromium aceita; alguns proxies
-  corporativos podem barrar.
-
----
+1. **Mapeamento (autenticado)** — criar GitHub Secrets `SIM_LOGIN` e
+   `SIM_PASSWORD` em **Settings → Secrets and variables → Actions**.
+2. **Frota (sem auth)** — não exige secrets.
+3. Garantir **Settings → Actions → General → Workflow permissions** em
+   "Read and write" (necessário para o commit automático).
+4. Disparar a primeira execução manualmente em **Actions → Run workflow**
+   para validar.
 
 ## Licença & Avisos
 
