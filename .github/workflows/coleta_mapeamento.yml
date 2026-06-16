@@ -38,6 +38,9 @@ jobs:
       SIM_PASSWORD: ${{ secrets.SIM_PASSWORD }}
       LOG_LEVEL: ${{ github.event.inputs.log_level || 'INFO' }}
       MAX_RELOGIN: ${{ github.event.inputs.max_relogin || '1' }}
+      # Opt-in para Node.js 24 nas actions JavaScript (Node 20 vai ser
+      # removido em set/2026). Funciona em todas as actions JS abaixo.
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,12 +57,20 @@ jobs:
           cache-dependency-path: collectors/mapeamento_veiculos/requirements.txt
 
       - name: Validar secrets
+        # Verifica se os secrets chegaram ao runner. Mostra só o COMPRIMENTO
+        # (que o GitHub mascara automaticamente quando o valor é o do
+        # secret), o que basta para diagnosticar "vazio" vs "configurado".
         run: |
+          echo "Diagnóstico de secrets (valores mascarados):"
+          echo "  SIM_LOGIN    → comprimento = ${#SIM_LOGIN}"
+          echo "  SIM_PASSWORD → comprimento = ${#SIM_PASSWORD}"
           if [ -z "$SIM_LOGIN" ] || [ -z "$SIM_PASSWORD" ]; then
-            echo "::error::Os secrets SIM_LOGIN e SIM_PASSWORD não estão configurados no repositório."
-            echo "Adicione em Settings → Secrets and variables → Actions."
+            echo "::error::SIM_LOGIN e/ou SIM_PASSWORD chegaram vazios."
+            echo "::error::Confira em Settings → Secrets and variables → *Actions* (não Codespaces nem Dependabot)."
+            echo "::error::E em 'Repository secrets' (não 'Environment secrets', a menos que adicione 'environment:' no job)."
             exit 1
           fi
+          echo "Secrets OK."
 
       - name: Instalar dependências Python
         run: |

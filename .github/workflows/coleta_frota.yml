@@ -21,6 +21,10 @@ jobs:
   coletar:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # Opt-in para Node.js 24 nas actions JavaScript (Node 20 vai ser
+      # removido em set/2026).
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
