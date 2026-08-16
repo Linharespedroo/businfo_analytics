@@ -1,8 +1,8 @@
 {
-  "generatedAt": "2026-08-15T06:58:13.895Z",
+  "generatedAt": "2026-08-16T06:59:52.504Z",
   "pipelineVersion": "1.0.0",
-  "rangeStart": "2026-05-18",
-  "rangeEnd": "2026-08-15",
+  "rangeStart": "2026-05-19",
+  "rangeEnd": "2026-08-16",
   "source": "sample",
-  "sizeBytes": 397567
+  "sizeBytes": 397570
 }
